@@ -1,5 +1,5 @@
 use ansi_term::{
-    ANSIString, ANSIStrings,
+    ANSIString, ANSIStrings, Colour,
     Colour::{Fixed, RGB},
     Style,
 };
@@ -7,7 +7,6 @@ use std::collections::{BTreeMap, HashMap};
 use zellij_tile::prelude::actions::Action;
 use zellij_tile::prelude::actions::SearchDirection;
 use zellij_tile::prelude::*;
-use zellij_tile_utils::palette_match;
 
 // ---------------------------------------------------------------------------
 // Modifier style
@@ -32,151 +31,10 @@ impl ModifierStyle {
 }
 
 const DEFAULT_MODIFIER_STYLE: ModifierStyle = ModifierStyle::Long;
-const DEFAULT_HINT_FORMAT: &str = "{key} {action}";
-const DEFAULT_SEPARATOR: &str = "";
-
-// ---------------------------------------------------------------------------
-// Color configuration
-// ---------------------------------------------------------------------------
-
-/// Per-label color slots.  Each field is `None` when not configured, which
-/// causes the caller to fall back to the Zellij palette.
-#[derive(Default, Clone, Copy)]
-struct LabelColors {
-    key_fg: Option<ansi_term::Colour>,
-    key_bg: Option<ansi_term::Colour>,
-    label_fg: Option<ansi_term::Colour>,
-    label_bg: Option<ansi_term::Colour>,
-}
-
-/// Full color configuration parsed from the plugin config block.
-#[derive(Default, Clone)]
-struct ColorConfig {
-    /// Global defaults that override the palette for all labels.
-    defaults: LabelColors,
-    /// Per-label (and optionally per-mode) overrides.
-    /// Keys: `"new"`, `"pane.new"`, `"split right"`, `"pane.split right"`, …
-    overrides: HashMap<String, LabelColors>,
-}
-
-/// Parse `"#RRGGBB"` (or `"RRGGBB"`) into an `ansi_term::Colour`.
-/// Returns `None` for any other format — invalid values are silently ignored.
-fn parse_hex_color(s: &str) -> Option<ansi_term::Colour> {
-    let hex = s.trim().trim_start_matches('#');
-    if hex.len() != 6 {
-        return None;
-    }
-    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-    Some(RGB(r, g, b))
-}
-
-/// Scan the config map for keys matching `*_key_fg`, `*_key_bg`, `*_label_fg`,
-/// `*_label_bg` and build the per-label override table.
-///
-/// Naming convention:
-/// - `select_key_bg`          → label `"select"`, all modes
-/// - `split_right_key_bg`     → label `"split right"`, all modes
-/// - `pane.new_key_bg`        → label `"new"`, mode `"pane"` only
-/// - `pane.split_right_key_bg`→ label `"split right"`, mode `"pane"` only
-///
-/// Global defaults (`key_fg`, `key_bg`, `label_fg`, `label_bg`) are handled
-/// separately in `load()` and are NOT inserted into this map.
-fn parse_label_overrides(config: &BTreeMap<String, String>) -> HashMap<String, LabelColors> {
-    // Suffixes we recognise, ordered longest-first so `_label_fg` is checked
-    // before a hypothetical shorter suffix never conflicts.
-    const SUFFIXES: &[&str] = &["_key_fg", "_key_bg", "_label_fg", "_label_bg"];
-
-    // These bare keys are the global defaults — handled elsewhere.
-    const GLOBAL_DEFAULTS: &[&str] = &["key_fg", "key_bg", "label_fg", "label_bg"];
-
-    let mut overrides: HashMap<String, LabelColors> = HashMap::new();
-
-    'outer: for (config_key, value) in config.iter() {
-        // Skip the four global-default keys.
-        if GLOBAL_DEFAULTS.contains(&config_key.as_str()) {
-            continue;
-        }
-
-        for suffix in SUFFIXES {
-            if !config_key.ends_with(suffix) {
-                continue;
-            }
-
-            // Everything before the suffix is either `"label"` or
-            // `"mode.label"` (with underscores standing in for spaces).
-            let raw_prefix = &config_key[..config_key.len() - suffix.len()];
-            if raw_prefix.is_empty() {
-                continue 'outer;
-            }
-
-            // Build the lookup key used in `overrides`.
-            let lookup_key = if let Some(dot) = raw_prefix.find('.') {
-                let mode = &raw_prefix[..dot];
-                let label_raw = &raw_prefix[dot + 1..];
-                if mode.is_empty() || label_raw.is_empty() {
-                    continue 'outer;
-                }
-                // Labels use underscores in config but spaces internally.
-                format!("{}.{}", mode, label_raw.replace('_', " "))
-            } else {
-                // Label-only.
-                let label = raw_prefix.replace('_', " ");
-                label
-            };
-
-            // Guard against whitespace-only results.
-            if lookup_key.trim().is_empty() {
-                continue 'outer;
-            }
-
-            if let Some(color) = parse_hex_color(value) {
-                let entry = overrides.entry(lookup_key).or_default();
-                match *suffix {
-                    "_key_fg" => entry.key_fg = Some(color),
-                    "_key_bg" => entry.key_bg = Some(color),
-                    "_label_fg" => entry.label_fg = Some(color),
-                    "_label_bg" => entry.label_bg = Some(color),
-                    _ => {}
-                }
-            }
-
-            // Each config key can only match one suffix.
-            continue 'outer;
-        }
-    }
-
-    overrides
-}
-
-/// Resolve the effective colors for `label` in `mode`, applying the 4-level
-/// priority independently for each color slot:
-///
-/// 1. `"{mode}.{label}"` override  (most specific)
-/// 2. `"{label}"` override
-/// 3. Global default
-/// 4. Caller falls back to Zellij palette (when `None` is returned)
-fn get_colors_for_label(config: &ColorConfig, mode: Option<&str>, label: &str) -> LabelColors {
-    let mode_specific = mode.and_then(|m| config.overrides.get(&format!("{}.{}", m, label)));
-    let label_only = config.overrides.get(label);
-
-    // Each field resolved independently.
-    LabelColors {
-        key_fg: mode_specific.and_then(|o| o.key_fg)
-            .or_else(|| label_only.and_then(|o| o.key_fg))
-            .or(config.defaults.key_fg),
-        key_bg: mode_specific.and_then(|o| o.key_bg)
-            .or_else(|| label_only.and_then(|o| o.key_bg))
-            .or(config.defaults.key_bg),
-        label_fg: mode_specific.and_then(|o| o.label_fg)
-            .or_else(|| label_only.and_then(|o| o.label_fg))
-            .or(config.defaults.label_fg),
-        label_bg: mode_specific.and_then(|o| o.label_bg)
-            .or_else(|| label_only.and_then(|o| o.label_bg))
-            .or(config.defaults.label_bg),
-    }
-}
+/// Default `hint_format`. Bold key, plain action. Users override entirely with
+/// the zjstatus inline style syntax: `"#[fg=#X,bold]{key}#[fg=#Y] {action}"`.
+const DEFAULT_HINT_FORMAT: &str = "#[bold]{key}#[] {action}";
+const DEFAULT_SEPARATOR: &str = "  ";
 
 // ---------------------------------------------------------------------------
 // Plugin state
@@ -194,7 +52,6 @@ struct State {
     modifier_style: ModifierStyle,
     hint_format: String,
     separator: String,
-    color_config: ColorConfig,
     /// Maximum number of alternative keybindings shown per action (0 = unlimited).
     max_keys: usize,
     /// User-defined display aliases for action labels. Key = original label
@@ -203,7 +60,6 @@ struct State {
     /// User-defined display aliases for special bare keys.
     /// Key = lowercase key name (e.g. `"enter"`, `"space"`), value = replacement.
     key_aliases: HashMap<String, String>,
-    transparent_bg: bool,
 }
 
 register_plugin!(State);
@@ -338,15 +194,6 @@ impl ZellijPlugin for State {
             .get("separator")
             .cloned()
             .unwrap_or_else(|| DEFAULT_SEPARATOR.to_string());
-        self.color_config = ColorConfig {
-            defaults: LabelColors {
-                key_fg: configuration.get("key_fg").and_then(|s| parse_hex_color(s)),
-                key_bg: configuration.get("key_bg").and_then(|s| parse_hex_color(s)),
-                label_fg: configuration.get("label_fg").and_then(|s| parse_hex_color(s)),
-                label_bg: configuration.get("label_bg").and_then(|s| parse_hex_color(s)),
-            },
-            overrides: parse_label_overrides(&configuration),
-        };
         self.max_keys = configuration
             .get("max_keys")
             .and_then(|s| s.parse().ok())
@@ -365,10 +212,6 @@ impl ZellijPlugin for State {
                     .map(|key_raw| (key_raw.to_lowercase(), v.clone()))
             })
             .collect();
-        self.transparent_bg = configuration
-            .get("transparent_bg")
-            .map(|s| s.to_lowercase().parse::<bool>().unwrap_or(false))
-            .unwrap_or(false);
 
         request_permission(&[
             PermissionType::ReadApplicationState,
@@ -412,15 +255,12 @@ impl ZellijPlugin for State {
             let parts = render_hints_for_mode(
                 mode_info.mode,
                 &keymap,
-                &mode_info.style.colors,
-                &self.color_config,
                 self.modifier_style,
                 &self.hint_format,
                 &self.separator,
                 self.max_keys,
                 &self.action_aliases,
                 &self.key_aliases,
-                self.transparent_bg,
             );
 
             let ansi_strings = ANSIStrings(&parts);
@@ -691,86 +531,6 @@ fn get_key_separator(key_display: &[String]) -> &'static str {
 // Styled rendering
 // ---------------------------------------------------------------------------
 
-fn style_key_with_modifier(
-    key_bindings: &[KeyWithModifier],
-    palette: &Styling,
-    color_config: &ColorConfig,
-    mode: Option<&str>,
-    label: &str,
-    modifier_style: ModifierStyle,
-    key_aliases: &HashMap<String, String>,
-    transparent_bg: bool,
-) -> Vec<ANSIString<'static>> {
-    if key_bindings.is_empty() {
-        return vec![];
-    }
-
-    let resolved = get_colors_for_label(color_config, mode, label);
-    let fg = resolved
-        .key_fg
-        .unwrap_or_else(|| palette_match!(palette.ribbon_unselected.base));
-    let bg = resolved
-        .key_bg
-        .unwrap_or_else(|| palette_match!(palette.ribbon_unselected.background));
-    let base_style = || {
-        let mut style = Style::new().fg(fg);
-        if !transparent_bg {
-            style = style.on(bg);
-        }
-        style
-    };
-
-    let mut styled_parts = vec![];
-
-    let common_modifiers = get_common_modifiers(key_bindings.iter().collect());
-    let modifier_str = format_modifier_string(&common_modifiers, modifier_style);
-    let key_display = format_key_display(key_bindings, &common_modifiers, key_aliases);
-    let key_separator = get_key_separator(&key_display);
-
-    styled_parts.push(Style::new().paint(" "));
-
-    if !modifier_str.is_empty() {
-        let sep = modifier_separator(modifier_style);
-        styled_parts.push(base_style().bold().paint(format!(" {}{}", modifier_str, sep)));
-    } else {
-        styled_parts.push(base_style().paint(" "));
-    }
-
-    for (idx, key) in key_display.iter().enumerate() {
-        if idx > 0 && !key_separator.is_empty() {
-            styled_parts.push(base_style().paint(key_separator));
-        }
-        styled_parts.push(base_style().bold().paint(key.clone()));
-    }
-
-    styled_parts.push(base_style().paint(" "));
-
-    styled_parts
-}
-
-fn style_description(
-    description: &str,
-    palette: &Styling,
-    color_config: &ColorConfig,
-    mode: Option<&str>,
-    label: &str,
-    transparent_bg: bool,
-) -> Vec<ANSIString<'static>> {
-    let resolved = get_colors_for_label(color_config, mode, label);
-    let fg = resolved
-        .label_fg
-        .unwrap_or_else(|| palette_match!(palette.text_unselected.base));
-    let bg = resolved
-        .label_bg
-        .unwrap_or_else(|| palette_match!(palette.text_unselected.background));
-
-    let mut style = Style::new().fg(fg);
-    if !transparent_bg {
-        style = style.on(bg);
-    }
-
-    vec![style.paint(format!(" {} ", description))]
-}
 
 /// Plain-text key representation used by custom `hint_format` templates.
 fn format_key_plain(
@@ -820,6 +580,133 @@ fn get_select_key(keymap: &[(KeyWithModifier, Vec<Action>)]) -> Vec<KeyWithModif
 }
 
 // ---------------------------------------------------------------------------
+// zjstatus-style inline format parser: #[fg=#RRGGBB,bg=red,bold,italic,...]
+//
+// Spec follows zjstatus: each directive replaces the active style (no inherit
+// across directives). Recognised attrs:
+//   color: fg / bg
+//   color value: #RRGGBB hex, 0..255 ANSI index, named (red, bright_blue, ...)
+//   flags: bold, italic / italics, underscore, double-underscore,
+//          curly-underscore, dotted-underscore, dashed-underscore,
+//          blink, hidden, reverse, strikethrough
+// ---------------------------------------------------------------------------
+
+fn parse_color_token(s: &str) -> Option<Colour> {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix('#') {
+        if hex.len() == 6 {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            return Some(RGB(r, g, b));
+        }
+        return None;
+    }
+    if let Ok(n) = s.parse::<u8>() {
+        return Some(Fixed(n));
+    }
+    let named = match s.to_ascii_lowercase().as_str() {
+        "black" => Some(Fixed(0)),
+        "red" => Some(Fixed(1)),
+        "green" => Some(Fixed(2)),
+        "yellow" => Some(Fixed(3)),
+        "blue" => Some(Fixed(4)),
+        "magenta" | "purple" => Some(Fixed(5)),
+        "cyan" => Some(Fixed(6)),
+        "white" => Some(Fixed(7)),
+        "bright_black" | "gray" | "grey" => Some(Fixed(8)),
+        "bright_red" => Some(Fixed(9)),
+        "bright_green" => Some(Fixed(10)),
+        "bright_yellow" => Some(Fixed(11)),
+        "bright_blue" => Some(Fixed(12)),
+        "bright_magenta" | "bright_purple" => Some(Fixed(13)),
+        "bright_cyan" => Some(Fixed(14)),
+        "bright_white" => Some(Fixed(15)),
+        _ => None,
+    };
+    named
+}
+
+/// Parse one zjstatus-style directive body (the part inside `#[...]`).
+/// Ignores unknown tokens; bad color values silently fall through.
+fn parse_inline_directive(body: &str) -> Style {
+    let mut style = Style::new();
+    for raw in body.split(',') {
+        let token = raw.trim();
+        if token.is_empty() {
+            continue;
+        }
+        if let Some(rest) = token.strip_prefix("fg=") {
+            if let Some(c) = parse_color_token(rest) {
+                style = style.fg(c);
+            }
+            continue;
+        }
+        if let Some(rest) = token.strip_prefix("bg=") {
+            if let Some(c) = parse_color_token(rest) {
+                style = style.on(c);
+            }
+            continue;
+        }
+        match token.to_ascii_lowercase().as_str() {
+            "bold" => style = style.bold(),
+            "italic" | "italics" => style = style.italic(),
+            "underscore" | "underline" => style = style.underline(),
+            "double-underscore" | "curly-underscore" | "dotted-underscore"
+            | "dashed-underscore" => style = style.underline(), // ansi_term has only one underline kind
+            "blink" => style = style.blink(),
+            "hidden" => style = style.hidden(),
+            "reverse" => style = style.reverse(),
+            "strikethrough" => style = style.strikethrough(),
+            "dim" => style = style.dimmed(),
+            _ => {}
+        }
+    }
+    style
+}
+
+/// Render a `hint_format` using zjstatus segment-split semantics:
+/// the format string is split on `#[`; each segment looks like
+/// `directive_body]content` and renders `content` with the style parsed from
+/// `directive_body`. Each new `#[...]` resets the style — directives do NOT
+/// inherit. Inside `content`, `{key}` and `{action}` are substituted.
+///
+/// The first segment (before any `#[`) is rendered unstyled (terminal default).
+fn render_hint_format_inline(
+    parts: &mut Vec<ANSIString<'static>>,
+    hint_format: &str,
+    key_plain: &str,
+    action_text: &str,
+) {
+    let leads_with_directive = hint_format.starts_with("#[");
+    for (idx, segment) in hint_format.split("#[").enumerate() {
+        if segment.is_empty() {
+            continue;
+        }
+        let (style, content) = if idx == 0 && !leads_with_directive {
+            (Style::new(), segment.to_string())
+        } else {
+            // Segment format: <body>]<content>. If no `]`, treat whole thing
+            // as content with default style (matches zjstatus tolerance).
+            match segment.find(']') {
+                Some(end) => {
+                    let body = &segment[..end];
+                    let content = &segment[end + 1..];
+                    (parse_inline_directive(body), content.to_string())
+                }
+                None => (Style::new(), segment.to_string()),
+            }
+        };
+        let expanded = content
+            .replace("{key}", key_plain)
+            .replace("{action}", action_text);
+        if !expanded.is_empty() {
+            parts.push(style.paint(expanded));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Hint assembly
 // ---------------------------------------------------------------------------
 
@@ -827,33 +714,23 @@ fn add_hint(
     parts: &mut Vec<ANSIString<'static>>,
     keys: &[KeyWithModifier],
     description: &str,
-    palette: &Styling,
-    color_config: &ColorConfig,
-    mode: Option<&str>,
     modifier_style: ModifierStyle,
     hint_format: &str,
     separator: &str,
     max_keys: usize,
     action_aliases: &HashMap<String, String>,
     key_aliases: &HashMap<String, String>,
-    transparent_bg: bool,
 ) {
     if keys.is_empty() {
         return;
     }
 
-    // Apply max_keys truncation (0 = unlimited).
     let keys = if max_keys > 0 && keys.len() > max_keys {
         &keys[..max_keys]
     } else {
         keys
     };
 
-    // Apply key_aliases to the key slice by producing rewritten keys — we do
-    // this at the display level inside format_key_plain / style_key_with_modifier
-    // by passing the alias map through.
-
-    // Displayed label: alias overrides display only; color lookups use original.
     let display_label: &str = action_aliases
         .get(description)
         .map(|s| s.as_str())
@@ -863,69 +740,8 @@ fn add_hint(
         parts.push(Style::new().paint(separator.to_string()));
     }
 
-    if hint_format == DEFAULT_HINT_FORMAT {
-        // Default layout: two distinct styled blocks (key + action).
-        // Color lookup uses original `description` label.
-        let styled_keys = style_key_with_modifier(
-            keys,
-            palette,
-            color_config,
-            mode,
-            description,
-            modifier_style,
-            key_aliases,
-            transparent_bg,
-        );
-        parts.extend(styled_keys);
-        let styled_desc = style_description(
-            display_label,
-            palette,
-            color_config,
-            mode,
-            description,
-            transparent_bg,
-        );
-        parts.extend(styled_desc);
-    } else {
-        // Custom template: render as a single plain-text string.
-        let key_plain = format_key_plain(keys, modifier_style, key_aliases);
-        let rendered = hint_format
-            .replace("{key}", &key_plain)
-            .replace("{action}", display_label);
-
-        // Color lookup uses original `description` label.
-        let resolved = get_colors_for_label(color_config, mode, description);
-        let fg = resolved
-            .key_fg
-            .unwrap_or_else(|| palette_match!(palette.ribbon_unselected.base));
-        let bg = resolved
-            .key_bg
-            .unwrap_or_else(|| palette_match!(palette.ribbon_unselected.background));
-        let mut style = Style::new().fg(fg);
-        if !transparent_bg {
-            style = style.on(bg);
-        }
-
-        parts.push(style.paint(rendered));
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Mode → string
-// ---------------------------------------------------------------------------
-
-fn mode_to_str(mode: InputMode) -> Option<&'static str> {
-    match mode {
-        InputMode::Normal => Some("normal"),
-        InputMode::Pane => Some("pane"),
-        InputMode::Tab => Some("tab"),
-        InputMode::Resize => Some("resize"),
-        InputMode::Move => Some("move"),
-        InputMode::Scroll => Some("scroll"),
-        InputMode::Search => Some("search"),
-        InputMode::Session => Some("session"),
-        _ => None,
-    }
+    let key_plain = format_key_plain(keys, modifier_style, key_aliases);
+    render_hint_format_inline(parts, hint_format, &key_plain, display_label);
 }
 
 // ---------------------------------------------------------------------------
@@ -935,19 +751,15 @@ fn mode_to_str(mode: InputMode) -> Option<&'static str> {
 fn render_hints_for_mode(
     mode: InputMode,
     keymap: &[(KeyWithModifier, Vec<Action>)],
-    palette: &Styling,
-    color_config: &ColorConfig,
     modifier_style: ModifierStyle,
     hint_format: &str,
     separator: &str,
     max_keys: usize,
     action_aliases: &HashMap<String, String>,
     key_aliases: &HashMap<String, String>,
-    transparent_bg: bool,
 ) -> Vec<ANSIString<'static>> {
     let mut parts = vec![];
     let select_keys = get_select_key(keymap);
-    let mode_str = mode_to_str(mode);
 
     macro_rules! hint {
         ($keys:expr, $label:expr) => {
@@ -955,16 +767,12 @@ fn render_hints_for_mode(
                 &mut parts,
                 $keys,
                 $label,
-                palette,
-                color_config,
-                mode_str,
                 modifier_style,
                 hint_format,
                 separator,
                 max_keys,
                 action_aliases,
                 key_aliases,
-                transparent_bg,
             )
         };
     }
