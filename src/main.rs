@@ -60,6 +60,10 @@ struct State {
     /// User-defined display aliases for special bare keys.
     /// Key = lowercase key name (e.g. `"enter"`, `"space"`), value = replacement.
     key_aliases: HashMap<String, String>,
+    /// True once the host (zellij) has resolved the request_permission()
+    /// dialog. Until then, calls like pipe_message_to_plugin() are denied
+    /// with a runtime error, so we must NOT render before this flips.
+    permissions_granted: bool,
 }
 
 register_plugin!(State);
@@ -229,19 +233,27 @@ impl ZellijPlugin for State {
     }
 
     fn update(&mut self, event: Event) -> bool {
-        let mut should_render = !self.initialized;
+        let mut should_render = false;
         match event {
             Event::ModeUpdate(mode_info) => {
                 if self.mode_info != mode_info {
-                    should_render = true;
+                    self.mode_info = mode_info;
+                    self.base_mode_is_locked =
+                        self.mode_info.base_mode == Some(InputMode::Locked);
+                    // Only request a render when permissions are already in
+                    // place; otherwise pipe_message_to_plugin() will be denied
+                    // and the hints widget stays empty until the next mode
+                    // change.
+                    should_render = self.permissions_granted;
                 }
-                self.mode_info = mode_info;
-                self.base_mode_is_locked = self.mode_info.base_mode == Some(InputMode::Locked);
             }
-            Event::PermissionRequestResult(_result) => {
-                // Permissions resolved (granted or denied). Safe to hide the
-                // plugin pane from selection now.
+            Event::PermissionRequestResult(result) => {
+                // Permissions resolved. Hide the plugin pane from selection,
+                // then trigger the first real render. PermissionStatus is the
+                // single field of the event; treat any non-Granted as denied.
+                self.permissions_granted = matches!(result, PermissionStatus::Granted);
                 set_selectable(false);
+                should_render = true;
             }
             _ => {}
         };
@@ -249,6 +261,15 @@ impl ZellijPlugin for State {
     }
 
     fn render(&mut self, _rows: usize, _cols: usize) {
+        // Don't emit a pipe message before the host has granted
+        // MessageAndLaunchOtherPlugins. Doing so makes zellij log:
+        //   ERROR Plugin '...zjstatus-hints.wasm' permission
+        //         'MessageAndLaunchOtherPlugins' denied - Command
+        //         'MessageToPlugin' denied
+        // and the message is dropped (no retry).
+        if !self.permissions_granted {
+            return;
+        }
         let mode_info = &self.mode_info;
         let output = if !(self.hide_in_base_mode && Some(mode_info.mode) == mode_info.base_mode) {
             let keymap = get_keymap_for_mode(mode_info);
